@@ -34,7 +34,7 @@ import paramiko
 from paramiko import util
 from paramiko.auth_handler import AuthHandler
 from paramiko.ssh_gss import GSSAuth
-from paramiko.channel import Channel
+from paramiko.channel import Channel, ChannelIOProfileMount
 from paramiko.common import xffffffff, cMSG_CHANNEL_OPEN, cMSG_IGNORE, \
     cMSG_GLOBAL_REQUEST, DEBUG, MSG_KEXINIT, MSG_IGNORE, MSG_DISCONNECT, \
     MSG_DEBUG, ERROR, WARNING, cMSG_UNIMPLEMENTED, INFO, cMSG_KEXINIT, \
@@ -361,6 +361,9 @@ class Transport (threading.Thread, ClosingContextManager):
 
         # tracking open channels
         self._channels = ChannelMap()
+        # shared mount point for per-Channel I/O profile stacks; every
+        # channel mounted here keeps its own isolated stack
+        self.channel_io_profiles = ChannelIOProfileMount()
         self.channel_events = {}       # (id -> Event)
         self.channels_seen = {}        # (id -> True)
         self._channel_counter = 0
@@ -1581,6 +1584,7 @@ class Transport (threading.Thread, ClosingContextManager):
     def _unlink_channel(self, chanid):
         """used by a Channel to remove itself from the active channel list"""
         self._channels.delete(chanid)
+        self.channel_io_profiles.unregister(chanid)
 
     def _send_message(self, data):
         self.packetizer.send_message(data)

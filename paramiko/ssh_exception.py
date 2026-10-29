@@ -96,6 +96,22 @@ class ChannelException (SSHException):
         self.args = (code, text, )
 
 
+class ChannelProfileError (SSHException):
+    """
+    Exception raised when a pushed `.Channel` I/O profile frame is violated.
+
+    This is raised by the Channel I/O profile stack (see
+    `.ChannelIOProfileStack`) when an operation crosses the active frame --
+    for example, writing to a stream the frame denies, enabling
+    ``combine_stderr`` while a ``forbid_merge``/``dual_required`` frame is
+    active, or pushing a ``dual_required`` frame on a channel whose stderr is
+    already merged away.
+
+    .. versionadded:: 1.16
+    """
+    pass
+
+
 class BadHostKeyException (SSHException):
     """
     The host key given by the SSH server did not match what we were expecting.

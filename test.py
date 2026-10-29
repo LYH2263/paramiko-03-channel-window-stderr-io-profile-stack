@@ -36,6 +36,7 @@ sys.path.append('tests')
 from tests.test_message import MessageTest
 from tests.test_file import BufferedFileTest
 from tests.test_buffered_pipe import BufferedPipeTest
+from tests.test_channel import ChannelIOProfileTest
 from tests.test_util import UtilTest
 from tests.test_hostkeys import HostKeysTest
 from tests.test_pkey import KeyTest
@@ -148,6 +149,7 @@ def main():
     suite.addTest(unittest.makeSuite(MessageTest))
     suite.addTest(unittest.makeSuite(BufferedFileTest))
     suite.addTest(unittest.makeSuite(BufferedPipeTest))
+    suite.addTest(unittest.makeSuite(ChannelIOProfileTest))
     suite.addTest(unittest.makeSuite(UtilTest))
     suite.addTest(unittest.makeSuite(HostKeysTest))
     if options.use_pkey:

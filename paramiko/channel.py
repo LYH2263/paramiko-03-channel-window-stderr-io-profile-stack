@@ -34,11 +34,506 @@ from paramiko.common import cMSG_CHANNEL_REQUEST, cMSG_CHANNEL_WINDOW_ADJUST, \
     cMSG_CHANNEL_CLOSE
 from paramiko.message import Message
 from paramiko.py3compat import bytes_types
-from paramiko.ssh_exception import SSHException
+from paramiko.ssh_exception import SSHException, ChannelProfileError
 from paramiko.file import BufferedFile
 from paramiko.buffered_pipe import BufferedPipe, PipeTimeout
 from paramiko import pipe
 from paramiko.util import ClosingContextManager
+
+
+# ---------------------------------------------------------------------------
+# Channel I/O profile axes
+# ---------------------------------------------------------------------------
+#
+# A `ChannelIOProfile` is one frame of the per-Channel I/O profile stack (see
+# `ChannelIOProfileStack`).  Each frame may tighten one or more of the four
+# independent axes below; axes left as ``None`` inherit from the next frame
+# down (or from the Channel baseline when the stack is empty).
+
+#: extended data (stderr) routing axis
+#:
+#: ``separate``: MSG_CHANNEL_EXTENDED_DATA may only land in
+#: ``in_stderr_buffer``.
+STDERR_SEPARATE = 'separate'
+#: ``combine_to_stdout``: extended data for this frame must land in the
+#: primary ``in_buffer`` (backlog drained on push), and the stderr side emits
+#: no new data.
+STDERR_COMBINE_TO_STDOUT = 'combine_to_stdout'
+#: ``forbid_merge``: callers may not enable combine_stderr; an already merged
+#: channel cannot be split, so such a frame is read-only for outbound data.
+STDERR_FORBID_MERGE = 'forbid_merge'
+STDERR_MERGE_VALUES = (
+    STDERR_SEPARATE, STDERR_COMBINE_TO_STDOUT, STDERR_FORBID_MERGE,
+)
+
+#: inbound window acknowledgement axis
+#:
+#: ``threshold_batch``: honour ``in_window_threshold`` and only send
+#: MSG_CHANNEL_WINDOW_ADJUST in batches (the built-in behaviour).
+WINDOW_THRESHOLD_BATCH = 'threshold_batch'
+#: ``ack_every_read``: every recv/recv_stderr that consumes positive bytes
+#: observably emits a WINDOW_ADJUST; the threshold may not swallow it.
+WINDOW_ACK_EVERY_READ = 'ack_every_read'
+#: ``suppress_ack``: this frame must never emit a WINDOW_ADJUST.
+WINDOW_SUPPRESS_ACK = 'suppress_ack'
+WINDOW_ACK_VALUES = (
+    WINDOW_THRESHOLD_BATCH, WINDOW_ACK_EVERY_READ, WINDOW_SUPPRESS_ACK,
+)
+
+#: outbound delivery axis
+#:
+#: ``partial_ok``: send/send_stderr may return a partial byte count per the
+#: available window (the built-in behaviour).
+OUTBOUND_PARTIAL_OK = 'partial_ok'
+#: ``all_or_fail``: a single user send/send_stderr must exhaust the payload
+#: (sendall semantics); a partial single send must not masquerade as
+#: completion.
+OUTBOUND_ALL_OR_FAIL = 'all_or_fail'
+#: ``data_vs_extended``: MSG_CHANNEL_DATA and MSG_CHANNEL_EXTENDED_DATA exits
+#: stay strictly forked and observable.
+OUTBOUND_DATA_VS_EXTENDED = 'data_vs_extended'
+OUTBOUND_DELIVERY_VALUES = (
+    OUTBOUND_PARTIAL_OK, OUTBOUND_ALL_OR_FAIL, OUTBOUND_DATA_VS_EXTENDED,
+)
+
+#: stream access axis
+#:
+#: ``primary_ok``: only recv/send/makefile (the primary stream) may be used.
+STREAM_PRIMARY_OK = 'primary_ok'
+#: ``stderr_ok``: only recv_stderr/send_stderr/makefile_stderr may be used.
+STREAM_STDERR_OK = 'stderr_ok'
+#: ``dual_required``: acceptance must cover both streams independently; merge
+#: may not stand in for a real dual stream (cannot be pushed on a merged
+#: channel).
+STREAM_DUAL_REQUIRED = 'dual_required'
+STREAM_ACCESS_VALUES = (
+    STREAM_PRIMARY_OK, STREAM_STDERR_OK, STREAM_DUAL_REQUIRED,
+)
+
+#: observable tag recorded for the most recent outbound write exit
+OUTBOUND_KIND_DATA = 'data'
+OUTBOUND_KIND_EXTENDED_DATA = 'extended_data'
+
+_PRIMARY = 'primary'
+_STDERR = 'stderr'
+
+
+class ChannelIOProfile (object):
+    """
+    One frame of a `.ChannelIOProfileStack`.
+
+    Each axis is optional -- ``None`` means "inherit from the frame below (or
+    the Channel baseline)".  Non-``None`` values tighten that axis for the
+    lifetime of the frame.
+
+    :param str stderr_merge:
+        one of `STDERR_SEPARATE`, `STDERR_COMBINE_TO_STDOUT`,
+        `STDERR_FORBID_MERGE`.
+    :param str window_ack:
+        one of `WINDOW_THRESHOLD_BATCH`, `WINDOW_ACK_EVERY_READ`,
+        `WINDOW_SUPPRESS_ACK`.
+    :param str outbound_delivery:
+        one of `OUTBOUND_PARTIAL_OK`, `OUTBOUND_ALL_OR_FAIL`,
+        `OUTBOUND_DATA_VS_EXTENDED`.
+    :param str stream_access:
+        one of `STREAM_PRIMARY_OK`, `STREAM_STDERR_OK`,
+        `STREAM_DUAL_REQUIRED`.
+
+    .. versionadded:: 1.16
+    """
+
+    __slots__ = ('stderr_merge', 'window_ack', 'outbound_delivery',
+                 'stream_access')
+
+    def __init__(self, stderr_merge=None, window_ack=None,
+                 outbound_delivery=None, stream_access=None):
+        if stderr_merge is not None and \
+                stderr_merge not in STDERR_MERGE_VALUES:
+            raise ChannelProfileError(
+                'invalid stderr_merge %r' % (stderr_merge,))
+        if window_ack is not None and window_ack not in WINDOW_ACK_VALUES:
+            raise ChannelProfileError(
+                'invalid window_ack %r' % (window_ack,))
+        if outbound_delivery is not None and \
+                outbound_delivery not in OUTBOUND_DELIVERY_VALUES:
+            raise ChannelProfileError(
+                'invalid outbound_delivery %r' % (outbound_delivery,))
+        if stream_access is not None and \
+                stream_access not in STREAM_ACCESS_VALUES:
+            raise ChannelProfileError(
+                'invalid stream_access %r' % (stream_access,))
+        self.stderr_merge = stderr_merge
+        self.window_ack = window_ack
+        self.outbound_delivery = outbound_delivery
+        self.stream_access = stream_access
+
+    def __eq__(self, other):
+        return isinstance(other, ChannelIOProfile) and (
+            self.stderr_merge == other.stderr_merge
+            and self.window_ack == other.window_ack
+            and self.outbound_delivery == other.outbound_delivery
+            and self.stream_access == other.stream_access
+        )
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return hash((self.stderr_merge, self.window_ack,
+                     self.outbound_delivery, self.stream_access))
+
+    def __repr__(self):
+        return 'ChannelIOProfile(stderr_merge=%r, window_ack=%r, ' \
+            'outbound_delivery=%r, stream_access=%r)' % (
+                self.stderr_merge, self.window_ack,
+                self.outbound_delivery, self.stream_access,
+            )
+
+
+class EffectiveChannelIOProfile (object):
+    """
+    The resolved, read-only view of a `.ChannelIOProfileStack`.
+
+    Unlike a `.ChannelIOProfile` frame, every axis here reflects the topmost
+    frame tightening it merged with the Channel baseline.
+
+    :ivar str stderr_merge:
+        the effective extended-data routing, always either
+        `STDERR_SEPARATE` or `STDERR_COMBINE_TO_STDOUT`.
+    :ivar str stderr_merge_policy:
+        the raw top-of-stack marker for the merge axis (may be
+        `STDERR_FORBID_MERGE` or ``None``); use ``stderr_merge`` for actual
+        routing.
+    :ivar str window_ack:
+        effective WINDOW_ADJUST policy.
+    :ivar str outbound_delivery:
+        effective outbound delivery policy.
+    :ivar str stream_access:
+        effective stream restriction, or ``None`` when both streams are
+        unrestricted (the baseline).
+
+    .. versionadded:: 1.16
+    """
+
+    __slots__ = ('stderr_merge', 'stderr_merge_policy', 'window_ack',
+                 'outbound_delivery', 'stream_access')
+
+    def __init__(self, stderr_merge, stderr_merge_policy, window_ack,
+                 outbound_delivery, stream_access):
+        self.stderr_merge = stderr_merge
+        self.stderr_merge_policy = stderr_merge_policy
+        self.window_ack = window_ack
+        self.outbound_delivery = outbound_delivery
+        self.stream_access = stream_access
+
+    def __eq__(self, other):
+        return isinstance(other, EffectiveChannelIOProfile) and (
+            self.stderr_merge == other.stderr_merge
+            and self.stderr_merge_policy == other.stderr_merge_policy
+            and self.window_ack == other.window_ack
+            and self.outbound_delivery == other.outbound_delivery
+            and self.stream_access == other.stream_access
+        )
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __repr__(self):
+        return 'EffectiveChannelIOProfile(stderr_merge=%r, ' \
+            'stderr_merge_policy=%r, window_ack=%r, ' \
+            'outbound_delivery=%r, stream_access=%r)' % (
+                self.stderr_merge, self.stderr_merge_policy,
+                self.window_ack, self.outbound_delivery,
+                self.stream_access,
+            )
+
+
+class ChannelIOProfileStack (object):
+    """
+    A push/pop stack of `.ChannelIOProfile` frames bound to one `.Channel`.
+
+    The stack itself lives on its Channel (``channel.io_profile_stack``) and
+    is also reachable through the session-wide shared mount
+    ``transport.channel_io_profiles``; concurrent channels therefore enter a
+    shared mount point but each channel has an isolated stack and frames can
+    never leak across channels.
+
+    Frames are restored in order on pop (nested use), and there is no
+    process-global fallback profile: an empty stack yields the plain Channel
+    baseline.
+
+    .. versionadded:: 1.16
+    """
+
+    def __init__(self, channel):
+        self._channel = channel
+        self._stack = []
+        self._lock = threading.RLock()
+        #: tag of the most recent outbound exit used by user code, one of
+        #: OUTBOUND_KIND_DATA / OUTBOUND_KIND_EXTENDED_DATA -- makes the
+        #: DATA vs EXTENDED_DATA message fork observable without a wire.
+        self.last_outbound_kind = None
+
+    def __len__(self):
+        return len(self._stack)
+
+    def __nonzero__(self):
+        return bool(self._stack)
+
+    __bool__ = __nonzero__
+
+    def frames(self):
+        """Return a copy of the currently pushed frames, bottom to top."""
+        with self._lock:
+            return list(self._stack)
+
+    def top(self):
+        """Return the current top frame, or ``None`` when the stack is empty."""
+        with self._lock:
+            if not self._stack:
+                return None
+            return self._stack[-1]
+
+    def push(self, profile):
+        """
+        Push a `.ChannelIOProfile` frame onto this channel's stack.
+
+        :return: the pushed profile.
+        :raises ChannelProfileError: if the frame contradicts the state below
+            it (e.g. ``dual_required`` on a channel whose stderr is already
+            merged away).
+        """
+        if not isinstance(profile, ChannelIOProfile):
+            raise ChannelProfileError(
+                'expected a ChannelIOProfile, got %r' % (profile,))
+        drain = False
+        with self._lock:
+            below = self._resolve_locked()
+            if profile.stream_access == STREAM_DUAL_REQUIRED and \
+                    below.stderr_merge == STDERR_COMBINE_TO_STDOUT:
+                raise ChannelProfileError(
+                    'cannot push dual_required: stderr is merged into the '
+                    'primary stream, the two streams cannot both be covered')
+            self._stack.append(profile)
+            if profile.stderr_merge == STDERR_COMBINE_TO_STDOUT:
+                drain = True
+        if drain:
+            # mirror set_combine_stderr(True)'s backlog drain, but the
+            # combine_stderr flag itself is never touched
+            data = self._channel._drain_stderr_backlog()
+            if len(data) > 0:
+                self._channel._feed(data)
+        return profile
+
+    def pop(self, expected=None):
+        """
+        Pop the top frame, restoring the previous (outer) profile.
+
+        :param expected:
+            if given, must be the frame currently on top (identity or value),
+            catching frame ordering bugs.
+        :raises ChannelProfileError: if the stack is empty or ``expected``
+            does not match the top frame.
+        """
+        with self._lock:
+            if not self._stack:
+                raise ChannelProfileError(
+                    'cannot pop Channel I/O profile: stack is empty')
+            profile = self._stack.pop()
+            if expected is not None and expected is not profile and \
+                    expected != profile:
+                self._stack.append(profile)
+                raise ChannelProfileError(
+                    'profile stack top is %r, not %r' % (profile, expected))
+        return profile
+
+    def pushed(self, profile):
+        """Return a context manager that pushes/pops ``profile``."""
+        return _ChannelIOProfileContext(self, profile)
+
+    def effective(self):
+        """
+        Return the `.EffectiveChannelIOProfile`: top-of-stack merged with the
+        Channel baseline.
+        """
+        with self._lock:
+            return self._resolve_locked()
+
+    # -- resolution -----------------------------------------------------
+
+    def _resolve_locked(self):
+        marker = None
+        window_ack = None
+        outbound = None
+        stream_access = None
+        for frame in reversed(self._stack):
+            if marker is None and frame.stderr_merge is not None:
+                marker = frame.stderr_merge
+            if window_ack is None and frame.window_ack is not None:
+                window_ack = frame.window_ack
+            if outbound is None and frame.outbound_delivery is not None:
+                outbound = frame.outbound_delivery
+            if stream_access is None and frame.stream_access is not None:
+                stream_access = frame.stream_access
+
+        # Resolve actual extended-data routing.  forbid_merge never *opens*
+        # a merge and cannot split an already merged stream, so it falls
+        # through to the state below it.
+        if marker in (None, STDERR_FORBID_MERGE):
+            routing = None
+            skip_top_forbid = marker == STDERR_FORBID_MERGE
+            for frame in reversed(self._stack):
+                value = frame.stderr_merge
+                if skip_top_forbid:
+                    if value is not None:
+                        skip_top_forbid = False
+                        if value == STDERR_FORBID_MERGE:
+                            skip_top_forbid = True
+                        continue
+                if value == STDERR_COMBINE_TO_STDOUT:
+                    routing = STDERR_COMBINE_TO_STDOUT
+                    break
+                if value == STDERR_SEPARATE:
+                    routing = STDERR_SEPARATE
+                    break
+            if routing is None:
+                routing = (
+                    STDERR_COMBINE_TO_STDOUT
+                    if self._channel.combine_stderr
+                    else STDERR_SEPARATE
+                )
+        else:
+            routing = marker
+
+        return EffectiveChannelIOProfile(
+            stderr_merge=routing,
+            stderr_merge_policy=marker,
+            window_ack=window_ack or WINDOW_THRESHOLD_BATCH,
+            outbound_delivery=outbound or OUTBOUND_PARTIAL_OK,
+            stream_access=stream_access,
+        )
+
+    # -- per-exit gates --------------------------------------------------
+
+    def gate_stream(self, stream, action):
+        """
+        Gate one user-facing stream exit.
+
+        :param str stream: ``'primary'`` (recv/send/makefile) or ``'stderr'``
+            (recv_stderr/send_stderr/makefile_stderr).
+        :param str action: ``'read'`` or ``'write'``.
+        """
+        with self._lock:
+            view = self._resolve_locked()
+            access = view.stream_access
+            if access == STREAM_PRIMARY_OK and stream != _PRIMARY:
+                raise ChannelProfileError(
+                    'active profile %r denies access to the stderr extended '
+                    'stream' % (self.top(),))
+            if access == STREAM_STDERR_OK and stream != _STDERR:
+                raise ChannelProfileError(
+                    'active profile %r denies access to the primary stream'
+                    % (self.top(),))
+            # dual_required allows both -- push-time validation guarantees
+            # the stderr side really exists
+            if action == 'write' and \
+                    view.stderr_merge_policy == STDERR_FORBID_MERGE and \
+                    view.stderr_merge == STDERR_COMBINE_TO_STDOUT:
+                raise ChannelProfileError(
+                    'forbid_merge frame on an already combined channel is '
+                    'read-only')
+
+    def gate_set_combine_stderr(self, combine):
+        """Gate `.Channel.set_combine_stderr` against active frames."""
+        if not combine:
+            return
+        with self._lock:
+            view = self._resolve_locked()
+            if view.stderr_merge_policy == STDERR_FORBID_MERGE:
+                raise ChannelProfileError(
+                    'active profile forbids enabling combine_stderr')
+            if view.stream_access == STREAM_DUAL_REQUIRED:
+                raise ChannelProfileError(
+                    'active dual_required profile forbids merging stderr '
+                    'into stdout')
+
+    def note_outbound(self, kind):
+        self.last_outbound_kind = kind
+
+
+class _ChannelIOProfileContext (object):
+    """
+    Context manager that pushes a frame on enter and always pops *that same
+    frame* on exit, including when the body raises.
+    """
+
+    def __init__(self, stack, profile):
+        self._stack = stack
+        self._profile = profile
+
+    def __enter__(self):
+        self._stack.push(self._profile)
+        return self._profile
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._stack.pop(self._profile)
+        return False
+
+
+class ChannelIOProfileMount (object):
+    """
+    Session-scoped, shared mount point for per-channel I/O profile stacks.
+
+    One of these hangs off each `.Transport` (``channel_io_profiles``) so
+    middleware can address any channel's stack within the session, while
+    concurrent channels keep fully isolated stacks.
+
+    .. versionadded:: 1.16
+    """
+
+    def __init__(self):
+        self._stacks = {}
+        self._lock = threading.Lock()
+
+    def register(self, chanid, stack):
+        with self._lock:
+            self._stacks[chanid] = stack
+
+    def unregister(self, chanid):
+        with self._lock:
+            self._stacks.pop(chanid, None)
+
+    def get(self, chanid):
+        """Return the `.ChannelIOProfileStack` for ``chanid``, or ``None``."""
+        with self._lock:
+            return self._stacks.get(chanid)
+
+    def chanids(self):
+        with self._lock:
+            return list(self._stacks.keys())
+
+    def __contains__(self, chanid):
+        with self._lock:
+            return chanid in self._stacks
+
+    def __len__(self):
+        with self._lock:
+            return len(self._stacks)
+
+    def push(self, chanid, profile):
+        stack = self.get(chanid)
+        if stack is None:
+            raise ChannelProfileError(
+                'no channel %r mounted in this session' % (chanid,))
+        return stack.push(profile)
+
+    def pop(self, chanid, expected=None):
+        stack = self.get(chanid)
+        if stack is None:
+            raise ChannelProfileError(
+                'no channel %r mounted in this session' % (chanid,))
+        return stack.pop(expected)
+
 
 
 def open_only(func):
@@ -121,6 +616,10 @@ class Channel (ClosingContextManager):
         self.combine_stderr = False
         self.exit_status = -1
         self.origin_addr = None
+        #: per-channel push/pop stack of I/O profile frames; also mounted on
+        #: the owning Transport as ``channel_io_profiles`` (shared mount,
+        #: isolated per channel)
+        self.io_profile_stack = ChannelIOProfileStack(self)
 
     def __del__(self):
         try:
@@ -535,6 +1034,7 @@ class Channel (ClosingContextManager):
 
         .. versionadded:: 1.1
         """
+        self.io_profile_stack.gate_set_combine_stderr(combine)
         data = bytes()
         self.lock.acquire()
         try:
@@ -548,6 +1048,71 @@ class Channel (ClosingContextManager):
         if len(data) > 0:
             self._feed(data)
         return old
+
+    # -- Channel I/O profile stack -------------------------------------
+
+    def push_io_profile(self, profile=None, stderr_merge=None, window_ack=None,
+                        outbound_delivery=None, stream_access=None):
+        """
+        Push an I/O profile frame onto this channel's stack.
+
+        Either pass a ready `.ChannelIOProfile` as ``profile`` or build one
+        from the keyword axes (``None`` axes inherit from below).  Returns
+        the pushed frame.
+
+        .. versionadded:: 1.16
+        """
+        if profile is None:
+            profile = ChannelIOProfile(
+                stderr_merge=stderr_merge,
+                window_ack=window_ack,
+                outbound_delivery=outbound_delivery,
+                stream_access=stream_access,
+            )
+        return self.io_profile_stack.push(profile)
+
+    def pop_io_profile(self, profile=None):
+        """
+        Pop the top I/O profile frame, restoring the outer profile.
+
+        .. versionadded:: 1.16
+        """
+        return self.io_profile_stack.pop(profile)
+
+    def io_profile(self, stderr_merge=None, window_ack=None,
+                   outbound_delivery=None, stream_access=None):
+        """
+        Return a context manager that pushes the given frame for the duration
+        of the ``with`` block and always pops it again on exit -- including
+        when the block raises -- leaving the outer (possibly baseline) profile
+        in place.
+
+        .. versionadded:: 1.16
+        """
+        profile = ChannelIOProfile(
+            stderr_merge=stderr_merge,
+            window_ack=window_ack,
+            outbound_delivery=outbound_delivery,
+            stream_access=stream_access,
+        )
+        return self.io_profile_stack.pushed(profile)
+
+    def get_io_profile(self):
+        """
+        Return the effective `.EffectiveChannelIOProfile` for this channel:
+        the top-of-stack merged with the channel baseline.
+
+        .. versionadded:: 1.16
+        """
+        return self.io_profile_stack.effective()
+
+    def _drain_stderr_backlog(self):
+        """Move (and return) everything currently queued in the stderr pipe."""
+        self.lock.acquire()
+        try:
+            return self.in_stderr_buffer.empty()
+        finally:
+            self.lock.release()
 
     ###  socket API
 
@@ -661,6 +1226,7 @@ class Channel (ClosingContextManager):
         :raises socket.timeout:
             if no data is ready before the timeout set by `settimeout`.
         """
+        self.io_profile_stack.gate_stream(_PRIMARY, 'read')
         try:
             out = self.in_buffer.read(nbytes, self.timeout)
         except PipeTimeout:
@@ -709,6 +1275,7 @@ class Channel (ClosingContextManager):
 
         .. versionadded:: 1.1
         """
+        self.io_profile_stack.gate_stream(_STDERR, 'read')
         try:
             out = self.in_stderr_buffer.read(nbytes, self.timeout)
         except PipeTimeout:
@@ -760,10 +1327,18 @@ class Channel (ClosingContextManager):
         :raises socket.timeout: if no data could be sent before the timeout set
             by `settimeout`.
         """
+        self.io_profile_stack.gate_stream(_PRIMARY, 'write')
+        self.io_profile_stack.note_outbound(OUTBOUND_KIND_DATA)
 
         m = Message()
         m.add_byte(cMSG_CHANNEL_DATA)
         m.add_int(self.remote_chanid)
+        if self.io_profile_stack.effective().outbound_delivery == \
+                OUTBOUND_ALL_OR_FAIL:
+            # this frame forbids a single partial send masquerading as
+            # completion: exhaust the payload, rebuilding MSG_CHANNEL_DATA
+            # for each window-sized slice
+            return self._sendall_primary(s, m)
         return self._send(s, m)
 
     def send_stderr(self, s):
@@ -783,12 +1358,54 @@ class Channel (ClosingContextManager):
 
         .. versionadded:: 1.1
         """
+        self.io_profile_stack.gate_stream(_STDERR, 'write')
+        self.io_profile_stack.note_outbound(OUTBOUND_KIND_EXTENDED_DATA)
 
         m = Message()
         m.add_byte(cMSG_CHANNEL_EXTENDED_DATA)
         m.add_int(self.remote_chanid)
         m.add_int(1)
+        if self.io_profile_stack.effective().outbound_delivery == \
+                OUTBOUND_ALL_OR_FAIL:
+            # exhaust the payload on the extended stream, rebuilding
+            # MSG_CHANNEL_EXTENDED_DATA (code=1) for each window-sized slice
+            return self._sendall_stderr(s, m)
         return self._send(s, m)
+
+    def _sendall_primary(self, s, m):
+        # all_or_fail delivery for the primary stream: keep sending fresh
+        # MSG_CHANNEL_DATA messages until the whole payload is delivered.
+        total = 0
+        while s:
+            sent = self._send(s, m)
+            if sent == 0:
+                raise socket.error('socket connection broken')
+            total += sent
+            s = s[sent:]
+            if s:
+                m = Message()
+                m.add_byte(cMSG_CHANNEL_DATA)
+                m.add_int(self.remote_chanid)
+        return total
+
+    def _sendall_stderr(self, s, m):
+        # all_or_fail delivery for the stderr stream: keep sending fresh
+        # MSG_CHANNEL_EXTENDED_DATA messages (code=1) until the whole payload
+        # is delivered.  Deliberately not unified with _sendall_primary: the
+        # two wire exits stay independently forked.
+        total = 0
+        while s:
+            sent = self._send(s, m)
+            if sent == 0:
+                raise socket.error('socket connection broken')
+            total += sent
+            s = s[sent:]
+            if s:
+                m = Message()
+                m.add_byte(cMSG_CHANNEL_EXTENDED_DATA)
+                m.add_int(self.remote_chanid)
+                m.add_int(1)
+        return total
 
 
     def sendall(self, s):
@@ -843,6 +1460,7 @@ class Channel (ClosingContextManager):
 
         :return: `.ChannelFile` object which can be used for Python file I/O.
         """
+        self.io_profile_stack.gate_stream(_PRIMARY, 'read')
         return ChannelFile(*([self] + list(params)))
 
     def makefile_stderr(self, *params):
@@ -852,14 +1470,15 @@ class Channel (ClosingContextManager):
         without a pty will ever have data on the stderr stream.
 
         The optional ``mode`` and ``bufsize`` arguments are interpreted the
-        same way as by the built-in ``file()`` function in Python.  For a
-        client, it only makes sense to open this file for reading.  For a
-        server, it only makes sense to open this file for writing.
+        same way as by the built-in ``file()`` function.  For a client, it
+        only makes sense to open this file for reading.  For a server, it
+        only makes sense to open this file for writing.
 
         :return: `.ChannelFile` object which can be used for Python file I/O.
 
         .. versionadded:: 1.1
         """
+        self.io_profile_stack.gate_stream(_STDERR, 'read')
         return ChannelStderrFile(*([self] + list(params)))
 
     def fileno(self):
@@ -950,6 +1569,10 @@ class Channel (ClosingContextManager):
     def _set_transport(self, transport):
         self.transport = transport
         self.logger = util.get_logger(self.transport.get_log_channel())
+        # mount this channel's profile stack on the session-wide shared
+        # mount point; concurrent channels keep isolated stacks
+        transport.channel_io_profiles.register(self.chanid,
+                                               self.io_profile_stack)
 
     def _set_window(self, window_size, max_packet_size):
         self.in_window_size = window_size
@@ -997,7 +1620,10 @@ class Channel (ClosingContextManager):
         if code != 1:
             self._log(ERROR, 'unknown extended_data type %d; discarding' % code)
             return
-        if self.combine_stderr:
+        # effective routing: an empty stack resolves this to exactly the
+        # combine_stderr flag, so the un-profiled behaviour is unchanged
+        if self.io_profile_stack.effective().stderr_merge == \
+                STDERR_COMBINE_TO_STDOUT:
             self._feed(s)
         else:
             self.in_stderr_buffer.feed(s)
@@ -1208,12 +1834,32 @@ class Channel (ClosingContextManager):
             self.lock.release()
 
     def _check_add_window(self, n):
+        # Observable fork on the WINDOW_ADJUST exit:
+        #   threshold_batch -> built-in batched accounting
+        #   ack_every_read  -> any positive read acks immediately
+        #   suppress_ack    -> no WINDOW_ADJUST leaves this frame
+        # An empty stack resolves to threshold_batch, byte-for-byte the
+        # original accounting below.
+        ack_mode = self.io_profile_stack.effective().window_ack
         self.lock.acquire()
         try:
             if self.closed or self.eof_received or not self.active:
                 return 0
             if self.ultra_debug:
                 self._log(DEBUG, 'addwindow %d' % n)
+            if ack_mode == WINDOW_SUPPRESS_ACK:
+                # keep the consumed-byte accounting so a later frame can
+                # catch up, but never emit while this frame is active
+                self.in_window_sofar += n
+                return 0
+            if ack_mode == WINDOW_ACK_EVERY_READ:
+                if n <= 0:
+                    return 0
+                out = self.in_window_sofar + n
+                self.in_window_sofar = 0
+                if self.ultra_debug:
+                    self._log(DEBUG, 'addwindow send %d' % out)
+                return out
             self.in_window_sofar += n
             if self.in_window_sofar <= self.in_window_threshold:
                 return 0

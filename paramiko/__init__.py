@@ -32,9 +32,16 @@ from paramiko.client import SSHClient, MissingHostKeyPolicy, AutoAddPolicy, Reje
 from paramiko.auth_handler import AuthHandler
 from paramiko.ssh_gss import GSSAuth, GSS_AUTH_AVAILABLE
 from paramiko.channel import Channel, ChannelFile
+from paramiko.channel import ChannelIOProfile, EffectiveChannelIOProfile, \
+    ChannelIOProfileStack, ChannelIOProfileMount
+from paramiko.channel import STDERR_SEPARATE, STDERR_COMBINE_TO_STDOUT, \
+    STDERR_FORBID_MERGE, WINDOW_THRESHOLD_BATCH, WINDOW_ACK_EVERY_READ, \
+    WINDOW_SUPPRESS_ACK, OUTBOUND_PARTIAL_OK, OUTBOUND_ALL_OR_FAIL, \
+    OUTBOUND_DATA_VS_EXTENDED, STREAM_PRIMARY_OK, STREAM_STDERR_OK, \
+    STREAM_DUAL_REQUIRED
 from paramiko.ssh_exception import SSHException, PasswordRequiredException, \
     BadAuthenticationType, ChannelException, BadHostKeyException, \
-    AuthenticationException, ProxyCommandFailure
+    AuthenticationException, ProxyCommandFailure, ChannelProfileError
 from paramiko.server import ServerInterface, SubsystemHandler, InteractiveQuery
 from paramiko.rsakey import RSAKey
 from paramiko.dsskey import DSSKey
@@ -73,6 +80,11 @@ __all__ = [ 'Transport',
             'SecurityOptions',
             'SubsystemHandler',
             'Channel',
+            'ChannelIOProfile',
+            'EffectiveChannelIOProfile',
+            'ChannelIOProfileStack',
+            'ChannelIOProfileMount',
+            'ChannelProfileError',
             'PKey',
             'RSAKey',
             'DSSKey',
